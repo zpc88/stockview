@@ -33,7 +33,7 @@ model Watchlist {
 }
 
 model KlineCache {
-  id        Int    @id @default(autoincrement())
+  id        Int      @id @default(autoincrement())
   symbol    String
   period    String
   date      String
@@ -43,6 +43,7 @@ model KlineCache {
   low       Float
   volume    Float
   amount    Float
+  updatedAt DateTime @updatedAt
 
   @@unique([symbol, period, date])
   @@index([symbol, period])
