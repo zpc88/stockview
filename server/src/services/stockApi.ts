@@ -47,11 +47,16 @@ function parseSinaQuote(raw: string, symbol: string): StockQuote | null {
   const name = parts[0];
   const open = parseFloat(parts[1]);
   const close = parseFloat(parts[2]); // 昨收
-  const currentPrice = parseFloat(parts[3]);
+  let currentPrice = parseFloat(parts[3]);
   const high = parseFloat(parts[4]);
   const low = parseFloat(parts[5]);
   const volume = parseFloat(parts[8]); // 成交量(股)
   const amount = parseFloat(parts[9]); // 成交额(元)
+
+  // 未开盘或停牌时 currentPrice 为 0，用昨收价代替
+  if (currentPrice === 0 && close > 0) {
+    currentPrice = close;
+  }
 
   const change = currentPrice - close;
   const changePercent = close > 0 ? (change / close) * 100 : 0;
@@ -98,8 +103,8 @@ function parseSinaUSQuote(raw: string, symbol: string): StockQuote | null {
   // 盘后数据
   const afterHoursPrice = parseFloat(parts[21]) || 0;
 
-  // 使用盘后价格（如果有且当前无交易）
-  const finalPrice = currentPrice || afterHoursPrice;
+  // 使用盘后价格（如果有且当前无交易），都没有则用昨收
+  const finalPrice = currentPrice || afterHoursPrice || close;
 
   // 自行计算涨跌额和涨跌幅（基于昨收）
   const change = close > 0 ? finalPrice - close : 0;
@@ -145,9 +150,16 @@ function parseSinaHKQuote(raw: string, symbol: string): StockQuote | null {
   const close = parseFloat(parts[3]) || 0; // 昨收
   const high = parseFloat(parts[4]) || 0;
   const low = parseFloat(parts[5]) || 0;
-  const currentPrice = parseFloat(parts[6]) || 0;
-  const change = parseFloat(parts[7]) || 0;
-  const changePercent = parseFloat(parts[8]) || 0;
+  let currentPrice = parseFloat(parts[6]) || 0;
+  let change = parseFloat(parts[7]) || 0;
+  let changePercent = parseFloat(parts[8]) || 0;
+
+  // 未开盘或停牌时 currentPrice 为 0，用昨收价代替
+  if (currentPrice === 0 && close > 0) {
+    currentPrice = close;
+    change = 0;
+    changePercent = 0;
+  }
   const volume = parseFloat(parts[11]) || 0; // 成交量(股)
   const amount = parseFloat(parts[12]) || 0; // 成交额(港元)
 
@@ -260,6 +272,7 @@ export async function saveQuoteHistory(quotes: StockQuote[]): Promise<void> {
 
   try {
     const validQuotes = quotes.filter((q) => q.date && q.currentPrice !== 0);
+    console.log(`[saveQuoteHistory] 收到${quotes.length}条行情, 有效${validQuotes.length}条`);
     await Promise.all(
       validQuotes.map((q) =>
         prisma.quoteHistory.upsert({
@@ -294,8 +307,9 @@ export async function saveQuoteHistory(quotes: StockQuote[]): Promise<void> {
         })
       )
     );
+    console.log(`[saveQuoteHistory] 写入成功: ${validQuotes.length}条`);
   } catch (error) {
-    console.error('Save quote history error:', error);
+    console.error('[saveQuoteHistory] 写入失败:', error);
   }
 }
 
@@ -488,44 +502,46 @@ async function searchHKStocksAPI(keyword: string): Promise<{ symbol: string; nam
   }
 }
 
-// 获取K线数据 (使用东方财富接口)
+// 获取K线数据 — 东方财富为主，腾讯为备选
 export async function fetchKlineData(symbol: string, period: string = 'day'): Promise<KlineItem[]> {
+  // 优先尝试东方财富
+  const emData = await fetchKlineFromEastmoney(symbol, period);
+  if (emData.length > 0) return emData;
+
+  // 东方财富失败，尝试腾讯
+  console.log(`[fetchKlineData] ${symbol} 东方财富失败，切换腾讯API`);
+  const txData = await fetchKlineFromTencent(symbol, period);
+  if (txData.length > 0) return txData;
+
+  console.warn(`[fetchKlineData] ${symbol} ${period} 所有数据源均失败`);
+  return [];
+}
+
+// 东方财富K线接口
+async function fetchKlineFromEastmoney(symbol: string, period: string): Promise<KlineItem[]> {
   try {
-    // 转换代码格式为东方财富 secid
     let secid: string;
     if (symbol.startsWith('us_')) {
-      // 美股: 105.AAPL (NASDAQ), 106.GS (NYSE) — 默认用105搜索，后面再精确匹配
       const code = symbol.substring(3);
       secid = `105.${code}`;
     } else if (symbol.startsWith('hk_')) {
-      // 港股: 100.00700
       const code = symbol.substring(3);
       secid = `100.${code}`;
     } else {
-      // A股
       const code = symbol.replace(/^(sh|sz)/, '');
       secid = symbol.startsWith('sh') ? `1.${code}` : `0.${code}`;
     }
 
     const kltMap: Record<string, string> = {
-      day: '101',
-      week: '102',
-      month: '103',
-      '5min': '5',
-      '15min': '15',
-      '30min': '30',
-      '60min': '60',
+      day: '101', week: '102', month: '103',
+      '5min': '5', '15min': '15', '30min': '30', '60min': '60',
     };
 
     const klt = kltMap[period] || '101';
     const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&klt=${klt}&fqt=1&end=20500101&lmt=120`;
 
     const response = await fetchWithTimeout(url);
-    const data = (await response.json()) as {
-      data?: {
-        klines?: string[];
-      };
-    };
+    const data = (await response.json()) as { data?: { klines?: string[] } };
 
     if (!data.data?.klines) return [];
 
@@ -542,7 +558,72 @@ export async function fetchKlineData(symbol: string, period: string = 'day'): Pr
       };
     });
   } catch (error) {
-    console.error('Fetch kline error:', error);
+    console.error(`[fetchKlineFromEastmoney] ${symbol} ${period} 失败:`, (error as Error).message);
+    return [];
+  }
+}
+
+// 腾讯K线接口（备选）
+async function fetchKlineFromTencent(symbol: string, period: string): Promise<KlineItem[]> {
+  try {
+    // 转换内部符号为腾讯格式
+    let txSymbol: string;
+    if (symbol.startsWith('us_')) {
+      // 美股需要 .OQ 后缀（NASDAQ）
+      txSymbol = `us${symbol.substring(3)}.OQ`;
+    } else if (symbol.startsWith('hk_')) {
+      txSymbol = `hk${symbol.substring(3)}`;
+    } else {
+      // A股: sh/sz 前缀，腾讯格式一致
+      txSymbol = symbol;
+    }
+
+    // 腾讯只支持 day/week/month，分钟级别暂不支持
+    const periodMap: Record<string, string> = {
+      day: 'day', week: 'week', month: 'month',
+    };
+    const txPeriod = periodMap[period];
+    if (!txPeriod) {
+      console.warn(`[fetchKlineFromTencent] 不支持 ${period} 周期`);
+      return [];
+    }
+
+    const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${txSymbol},${txPeriod},,,120,qfq`;
+    console.log(`[fetchKlineFromTencent] 请求: ${url}`);
+
+    const response = await fetchWithTimeout(url);
+    const data = (await response.json()) as Record<string, any>;
+
+    // 响应格式: { data: { "sh600519": { "qfqday": [...], "day": [...] } } }
+    const stockData = data.data?.[txSymbol];
+    if (!stockData) {
+      console.warn(`[fetchKlineFromTencent] ${txSymbol} 无数据, keys:`, Object.keys(data.data || {}));
+      return [];
+    }
+
+    // 优先取前复权数据
+    const klineKey = `qfq${txPeriod}`;
+    const klines = stockData[klineKey] || stockData[txPeriod];
+    if (!klines || !Array.isArray(klines)) {
+      console.warn(`[fetchKlineFromTencent] ${txSymbol} 无kline数组, keys:`, Object.keys(stockData));
+      return [];
+    }
+
+    // 腾讯格式: [date, open, close, high, low, volume, ?extra]
+    const result: KlineItem[] = klines.map((item: any[]) => ({
+      date: item[0],
+      open: parseFloat(item[1]),
+      close: parseFloat(item[2]),
+      high: parseFloat(item[3]),
+      low: parseFloat(item[4]),
+      volume: parseFloat(item[5]) || 0,
+      amount: 0, // 腾讯接口不提供成交额
+    }));
+
+    console.log(`[fetchKlineFromTencent] ${symbol} 成功: ${result.length}条, 首条=${result[0]?.date}, 末条=${result[result.length - 1]?.date}`);
+    return result;
+  } catch (error) {
+    console.error(`[fetchKlineFromTencent] ${symbol} ${period} 失败:`, (error as Error).message);
     return [];
   }
 }
@@ -580,52 +661,62 @@ export async function getCachedKline(symbol: string, period: string = 'day'): Pr
 export async function isCacheValid(symbol: string, period: string): Promise<boolean> {
   const latest = await prisma.klineCache.findFirst({
     where: { symbol, period },
-    orderBy: { date: 'desc' },
-    select: { date: true },
+    orderBy: { updatedAt: 'desc' },
+    select: { updatedAt: true },
   });
 
   if (!latest) return false;
 
   const ttl = CACHE_TTL[period] || CACHE_TTL.day;
-  const latestDate = new Date(latest.date).getTime();
-  return Date.now() - latestDate < ttl;
+  return Date.now() - latest.updatedAt.getTime() < ttl;
 }
 
 // 从API获取并更新缓存
 export async function fetchAndCacheKline(symbol: string, period: string = 'day'): Promise<KlineItem[]> {
+  console.log(`[fetchAndCacheKline] 开始: symbol=${symbol}, period=${period}`);
   const data = await fetchKlineData(symbol, period);
 
-  if (data.length === 0) return data;
+  if (data.length === 0) {
+    console.warn(`[fetchAndCacheKline] ${symbol} 获取到0条数据，跳过缓存写入`);
+    return data;
+  }
 
-  // 并行写入缓存
-  await Promise.all(
-    data.map((item) =>
-      prisma.klineCache.upsert({
-        where: {
-          symbol_period_date: { symbol, period, date: item.date },
-        },
-        update: {
-          open: item.open,
-          close: item.close,
-          high: item.high,
-          low: item.low,
-          volume: item.volume,
-          amount: item.amount,
-        },
-        create: {
-          symbol,
-          period,
-          date: item.date,
-          open: item.open,
-          close: item.close,
-          high: item.high,
-          low: item.low,
-          volume: item.volume,
-          amount: item.amount,
-        },
-      })
-    )
-  );
+  console.log(`[fetchAndCacheKline] ${symbol} 获取到${data.length}条数据，开始写入缓存...`);
+
+  try {
+    // 并行写入缓存
+    await Promise.all(
+      data.map((item) =>
+        prisma.klineCache.upsert({
+          where: {
+            symbol_period_date: { symbol, period, date: item.date },
+          },
+          update: {
+            open: item.open,
+            close: item.close,
+            high: item.high,
+            low: item.low,
+            volume: item.volume,
+            amount: item.amount,
+          },
+          create: {
+            symbol,
+            period,
+            date: item.date,
+            open: item.open,
+            close: item.close,
+            high: item.high,
+            low: item.low,
+            volume: item.volume,
+            amount: item.amount,
+          },
+        })
+      )
+    );
+    console.log(`[fetchAndCacheKline] ${symbol} 缓存写入成功: ${data.length}条`);
+  } catch (error) {
+    console.error(`[fetchAndCacheKline] ${symbol} 缓存写入失败:`, error);
+  }
 
   return data;
 }
@@ -1026,12 +1117,16 @@ export async function estimateFundReturn(symbol: string, fundName: string): Prom
   // 3. 计算每只股票的贡献
   const quoteMap = new Map(quotes.map((q) => [q.symbol, q]));
 
-  let estimateChange = 0;
+  // 计算重仓股总占比（季报中的前N大重仓股占基金净值比例之和）
+  const totalRatio = holdings.reduce((sum, h) => sum + h.ratio, 0);
+
+  // 计算重仓股的加权涨跌幅
+  let weightedChange = 0;
   const stockContributions = holdings.map((h) => {
     const quote = quoteMap.get(h.symbol);
     const stockChange = quote?.changePercent ?? 0;
     const contribution = (h.ratio / 100) * stockChange;
-    estimateChange += contribution;
+    weightedChange += contribution;
 
     return {
       symbol: h.symbol,
@@ -1042,6 +1137,25 @@ export async function estimateFundReturn(symbol: string, fundName: string): Prom
     };
   });
 
+  // 4. 归一化处理：将重仓股贡献外推到基金整体
+  //
+  // 原理：前N大重仓股占基金净值的 totalRatio%，剩余部分(100-totalRatio)%是
+  // 其他股票、债券、现金等。假设其他持仓与重仓股涨跌趋势相似（对于偏股型基金
+  // 这是合理近似），则基金整体涨跌 ≈ weightedChange / (totalRatio/100)。
+  //
+  // 对于 totalRatio 过低（<30%）的情况，说明重仓股数据不具代表性，
+  // 不做外推，直接返回加权值（更保守准确）。
+  let estimateChange: number;
+  if (totalRatio >= 30) {
+    // 外推到基金整体
+    estimateChange = weightedChange / (totalRatio / 100);
+  } else {
+    // 重仓股占比太低，不做外推
+    estimateChange = weightedChange;
+  }
+
+  console.log(`[estimateFundReturn] ${symbol}: 前${holdings.length}大重仓占比${totalRatio.toFixed(1)}%, 加权涨跌=${weightedChange.toFixed(4)}%, 归一化后=${estimateChange.toFixed(2)}%`);
+
   const result: FundEstimate = {
     fundSymbol: symbol,
     fundName,
@@ -1051,7 +1165,7 @@ export async function estimateFundReturn(symbol: string, fundName: string): Prom
     updateTime: new Date().toLocaleTimeString('zh-CN'),
   };
 
-  // 4. 保存到历史记录
+  // 5. 保存到历史记录
   await saveFundEstimateHistory(symbol, fundName, result).catch((err) => {
     console.error('Save fund estimate history error:', err);
   });
